@@ -1,0 +1,281 @@
+"""
+Module: ocr_engine.py
+Description: Optimized OCR Extraction Pipeline for Text & LayoutLMv3-Normalized Bounding Boxes
+Stack: EasyOCR / PaddleOCR, OpenCV, NumPy, PyTorch (CUDA / MPS / CPU)
+
+Provides:
+- Robust text token extraction from flattened/dewarped document images.
+- LayoutLMv3 coordinate normalization ([0, 1000] scale integer bounding boxes).
+- Top-to-bottom, left-to-right reading order sorting and line grouping.
+- Mixed orientation correction and confidence estimation.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import cv2
+import numpy as np
+import torch
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("OCREngine")
+
+
+@dataclass
+class OCRToken:
+    """Represents an extracted text token with absolute and LayoutLM-normalized coordinates."""
+    text: str
+    confidence: float                  # 0.0 to 1.0
+    bbox_pixel: List[int]              # [x0, y0, x1, y1] in image pixel space
+    bbox_normalized: List[int]         # [x0, y0, x1, y1] scaled to [0, 1000] for LayoutLMv3
+    polygon: Optional[List[List[int]]] = None  # 4-point quadrilateral
+    line_index: int = 0
+    reading_order: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class PaddleEasyOCREngine:
+    """
+    High-accuracy multilingual OCR engine with spatial coordinate normalization.
+    Supports PaddleOCR and EasyOCR backends with automatic GPU/MPS device selection.
+    """
+
+    def __init__(
+        self,
+        backend: str = "easyocr",  # "easyocr" or "paddleocr"
+        languages: List[str] = ["en", "hi"],
+        gpu: bool = True,
+        confidence_threshold: float = 0.25,
+    ):
+        self.backend = backend.lower()
+        self.languages = languages
+        self.confidence_threshold = confidence_threshold
+
+        # Explicit device mapping
+        if gpu and torch.cuda.is_available():
+            self.device = "cuda"
+            self.use_gpu = True
+        elif gpu and torch.backends.mps.is_available():
+            self.device = "mps"
+            self.use_gpu = True
+        else:
+            self.device = "cpu"
+            self.use_gpu = False
+
+        logger.info(f"Initializing OCR engine [{self.backend}] on device: {self.device} for languages: {languages}")
+
+        self._reader = None
+        self._init_backend()
+
+    def _init_backend(self) -> None:
+        """Loads backend OCR weights into memory."""
+        if self.backend == "easyocr":
+            try:
+                import easyocr
+                self._reader = easyocr.Reader(
+                    self.languages,
+                    gpu=(self.device == "cuda"),
+                    verbose=False
+                )
+                logger.info("EasyOCR model initialized successfully.")
+            except ImportError:
+                logger.warning("easyocr not installed; falling back to OpenCV mock OCR stub.")
+                self._reader = None
+        elif self.backend == "paddleocr":
+            try:
+                from paddleocr import PaddleOCR
+                self._reader = PaddleOCR(
+                    use_angle_cls=True,
+                    lang="en",
+                    use_gpu=(self.device == "cuda"),
+                    show_log=False
+                )
+                logger.info("PaddleOCR model initialized successfully.")
+            except ImportError:
+                logger.warning("paddleocr not installed; falling back to EasyOCR.")
+                self.backend = "easyocr"
+                self._init_backend()
+
+    @staticmethod
+    def normalize_bbox(
+        box: Union[List[int], Tuple[int, int, int, int]],
+        width: int,
+        height: int,
+    ) -> List[int]:
+        """
+        Normalizes pixel coordinates [x0, y0, x1, y1] to [0, 1000] scale
+        strictly required by LayoutLMv2 / LayoutLMv3 models.
+        Clamps values to [0, 1000] ensuring valid bounding boxes.
+        """
+        x0, y0, x1, y1 = box
+        w = max(width, 1)
+        h = max(height, 1)
+
+        norm_x0 = int(np.clip(round((min(x0, x1) / w) * 1000), 0, 1000))
+        norm_y0 = int(np.clip(round((min(y0, y1) / h) * 1000), 0, 1000))
+        norm_x1 = int(np.clip(round((max(x0, x1) / w) * 1000), 0, 1000))
+        norm_y1 = int(np.clip(round((max(y0, y1) / h) * 1000), 0, 1000))
+
+        # Enforce non-zero area
+        if norm_x1 <= norm_x0:
+            norm_x1 = min(1000, norm_x0 + 1)
+        if norm_y1 <= norm_y0:
+            norm_y1 = min(1000, norm_y0 + 1)
+
+        return [norm_x0, norm_y0, norm_x1, norm_y1]
+
+    def _sort_reading_order(self, tokens: List[OCRToken], line_tolerance_px: int = 14) -> List[OCRToken]:
+        """
+        Sorts bounding boxes into natural document reading order (top-to-bottom, left-to-right).
+        Groups tokens into horizontal lines using line_tolerance_px.
+        """
+        if not tokens:
+            return []
+
+        # Sort primarily by y0
+        sorted_by_y = sorted(tokens, key=lambda t: t.bbox_pixel[1])
+
+        lines: List[List[OCRToken]] = []
+        current_line: List[OCRToken] = []
+        current_line_y = sorted_by_y[0].bbox_pixel[1]
+
+        for token in sorted_by_y:
+            token_y = token.bbox_pixel[1]
+            if abs(token_y - current_line_y) <= line_tolerance_px:
+                current_line.append(token)
+            else:
+                if current_line:
+                    # Sort line tokens left-to-right
+                    current_line.sort(key=lambda t: t.bbox_pixel[0])
+                    lines.append(current_line)
+                current_line = [token]
+                current_line_y = token_y
+
+        if current_line:
+            current_line.sort(key=lambda t: t.bbox_pixel[0])
+            lines.append(current_line)
+
+        # Flatten and assign line index and sequential reading order
+        ordered_tokens: List[OCRToken] = []
+        global_order = 0
+        for line_idx, line in enumerate(lines):
+            for token in line:
+                token.line_index = line_idx
+                token.reading_order = global_order
+                global_order += 1
+                ordered_tokens.append(token)
+
+        return ordered_tokens
+
+    def extract_text_and_boxes(
+        self,
+        image: np.ndarray,
+        preprocess: bool = False,
+    ) -> Tuple[List[OCRToken], float]:
+        """
+        Runs OCR on the given image and extracts tokens with normalized LayoutLM bounding boxes.
+        Returns: (tokens, execution_time_ms)
+        """
+        t0 = time.perf_counter()
+        img_h, img_w = image.shape[:2]
+        extracted_tokens: List[OCRToken] = []
+
+        if preprocess:
+            # Gentle bilateral filter to preserve text edges
+            image = cv2.bilateralFilter(image, d=5, sigmaColor=50, sigmaSpace=50)
+
+        if self._reader is not None and self.backend == "easyocr":
+            # EasyOCR returns: [ [polygon, text, confidence], ... ]
+            raw_results = self._reader.readtext(image)
+            for poly, text, conf in raw_results:
+                if conf < self.confidence_threshold:
+                    continue
+                clean_text = text.strip()
+                if not clean_text:
+                    continue
+
+                poly_arr = np.array(poly, dtype=np.int32)
+                x0 = int(np.min(poly_arr[:, 0]))
+                y0 = int(np.min(poly_arr[:, 1]))
+                x1 = int(np.max(poly_arr[:, 0]))
+                y1 = int(np.max(poly_arr[:, 1]))
+
+                norm_box = self.normalize_bbox([x0, y0, x1, y1], img_w, img_h)
+
+                token = OCRToken(
+                    text=clean_text,
+                    confidence=float(conf),
+                    bbox_pixel=[x0, y0, x1, y1],
+                    bbox_normalized=norm_box,
+                    polygon=poly_arr.tolist(),
+                )
+                extracted_tokens.append(token)
+
+        elif self._reader is not None and self.backend == "paddleocr":
+            # PaddleOCR returns: [ [ [polygon], (text, conf) ], ... ]
+            result = self._reader.ocr(image, cls=True)
+            if result and result[0]:
+                for line in result[0]:
+                    poly = line[0]
+                    text, conf = line[1]
+                    if conf < self.confidence_threshold:
+                        continue
+                    poly_arr = np.array(poly, dtype=np.int32)
+                    x0 = int(np.min(poly_arr[:, 0]))
+                    y0 = int(np.min(poly_arr[:, 1]))
+                    x1 = int(np.max(poly_arr[:, 0]))
+                    y1 = int(np.max(poly_arr[:, 1]))
+
+                    norm_box = self.normalize_bbox([x0, y0, x1, y1], img_w, img_h)
+                    token = OCRToken(
+                        text=text.strip(),
+                        confidence=float(conf),
+                        bbox_pixel=[x0, y0, x1, y1],
+                        bbox_normalized=norm_box,
+                        polygon=poly_arr.tolist(),
+                    )
+                    extracted_tokens.append(token)
+
+        else:
+            # Heuristic text line extraction fallback (if OCR library not yet installed)
+            logger.info("Using heuristic text localization fallback.")
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w > 20 and h > 8:
+                    norm_box = self.normalize_bbox([x, y, x + w, y + h], img_w, img_h)
+                    extracted_tokens.append(
+                        OCRToken(
+                            text="SAMPLE_TOKEN",
+                            confidence=0.85,
+                            bbox_pixel=[x, y, x + w, y + h],
+                            bbox_normalized=norm_box,
+                        )
+                    )
+
+        # Apply reading order topological sorting
+        ordered_tokens = self._sort_reading_order(extracted_tokens)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        logger.info(f"OCR extracted {len(ordered_tokens)} tokens in {elapsed_ms:.2f}ms.")
+        return ordered_tokens, elapsed_ms
+
+
+if __name__ == "__main__":
+    dummy = np.zeros((400, 600, 3), dtype=np.uint8)
+    cv2.putText(dummy, "NET QUANTITY: 500g", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(dummy, "MRP Rs. 99.00 (INCL TAX)", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    engine = PaddleEasyOCREngine(backend="easyocr")
+    tokens, ms = engine.extract_text_and_boxes(dummy)
+    print(f"Extracted {len(tokens)} tokens in {ms:.2f}ms")
+    for t in tokens:
+        print(f" - '{t.text}' | BoxNorm: {t.bbox_normalized} | Conf: {t.confidence:.2f}")
