@@ -1,14 +1,11 @@
-"""
-OpenCV Preprocessing Pipeline for Scanned Historical Land Records.
 
-Each processing step is a standalone function that accepts and returns
-NumPy arrays, so steps can be reordered, skipped, or replaced independently.
+Each processing step is a standalone function that accepts and returns NumPy arrays, so steps can be reordered, skipped, or replaced independently.
 
 Usage:
     python pipeline.py input.jpg                  # default output: input_processed.jpg
     python pipeline.py input.jpg -o clean.png     # explicit output path
     python pipeline.py input.jpg --save-steps     # save every intermediate stage
-"""
+
 
 from __future__ import annotations
 
@@ -30,10 +27,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-@dataclass
+
 class PipelineConfig:
     """Centralised knobs for every processing stage."""
 
