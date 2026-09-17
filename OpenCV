@@ -1,0 +1,446 @@
+"""
+OpenCV Preprocessing Pipeline for Scanned Historical Land Records.
+
+Each processing step is a standalone function that accepts and returns
+NumPy arrays, so steps can be reordered, skipped, or replaced independently.
+
+Usage:
+    python pipeline.py input.jpg                  # default output: input_processed.jpg
+    python pipeline.py input.jpg -o clean.png     # explicit output path
+    python pipeline.py input.jpg --save-steps     # save every intermediate stage
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Sequence
+
+import cv2
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class PipelineConfig:
+    """Centralised knobs for every processing stage."""
+
+    # Document boundary detection
+    boundary_blur_ksize: int = 5
+    boundary_canny_low: int = 50
+    boundary_canny_high: int = 200
+    boundary_dilate_iter: int = 2
+    boundary_epsilon_ratio: float = 0.02  # contour approximation tolerance
+
+    # Deskew
+    deskew_angle_limit: float = 45.0  # ignore angles beyond ±limit
+
+    # Noise removal
+    denoise_h: int = 10               # filter strength (luminance)
+    denoise_template_window: int = 7
+    denoise_search_window: int = 21
+
+    # Morphological cleaning
+    morph_kernel_size: int = 1         # for small-speckle removal
+
+    # Contrast enhancement (CLAHE)
+    clahe_clip_limit: float = 2.0
+    clahe_grid_size: tuple[int, int] = (8, 8)
+
+    # Adaptive threshold
+    adaptive_block_size: int = 31      # must be odd
+    adaptive_c: int = 10
+
+    # Final resize (longest edge in px, 0 = keep original)
+    output_max_edge: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Step 1 – Document boundary detection
+# ---------------------------------------------------------------------------
+def detect_document_boundary(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> Optional[np.ndarray]:
+    """Return the four-corner polygon of the document, or *None* if not found.
+
+    The contour is returned as an array of shape (4, 2) in
+    top-left, top-right, bottom-right, bottom-left order.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (cfg.boundary_blur_ksize, cfg.boundary_blur_ksize), 0)
+    edges = cv2.Canny(blurred, cfg.boundary_canny_low, cfg.boundary_canny_high)
+
+    # Dilate to close small gaps in the document border
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=cfg.boundary_dilate_iter)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        log.warning("No contours found – boundary detection skipped.")
+        return None
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for cnt in contours[:5]:  # only inspect the largest candidates
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, cfg.boundary_epsilon_ratio * peri, True)
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype(np.float32)
+            return _order_points(pts)
+
+    log.warning("No quadrilateral contour found – boundary detection skipped.")
+    return None
+
+
+def _order_points(pts: np.ndarray) -> np.ndarray:
+    """Order four points as: top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    d = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(d)]
+    rect[3] = pts[np.argmax(d)]
+    return rect
+
+
+# ---------------------------------------------------------------------------
+# Step 2 – Perspective correction (four-point transform)
+# ---------------------------------------------------------------------------
+def correct_perspective(
+    image: np.ndarray,
+    corners: np.ndarray,
+) -> np.ndarray:
+    """Warp *image* so that the quadrilateral *corners* maps to a rectangle."""
+    tl, tr, br, bl = corners
+
+    width_top = np.linalg.norm(tr - tl)
+    width_bot = np.linalg.norm(br - bl)
+    max_w = int(max(width_top, width_bot))
+
+    height_left = np.linalg.norm(bl - tl)
+    height_right = np.linalg.norm(br - tr)
+    max_h = int(max(height_left, height_right))
+
+    dst = np.array(
+        [[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]],
+        dtype=np.float32,
+    )
+    M = cv2.getPerspectiveTransform(corners, dst)
+    warped = cv2.warpPerspective(image, M, (max_w, max_h))
+    log.info("Perspective corrected → %dx%d", max_w, max_h)
+    return warped
+
+
+# ---------------------------------------------------------------------------
+# Step 3 – Deskew
+# ---------------------------------------------------------------------------
+def deskew(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """Rotate the image to remove residual skew detected via the Hough transform."""
+    gray = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 3
+        else image
+    )
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=gray.shape[1] // 8,
+        maxLineGap=20,
+    )
+
+    if lines is None:
+        log.info("No lines detected – skipping deskew.")
+        return image
+
+    angles: list[float] = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if abs(angle) <= cfg.deskew_angle_limit:
+            angles.append(angle)
+
+    if not angles:
+        log.info("No usable line angles – skipping deskew.")
+        return image
+
+    median_angle = float(np.median(angles))
+    if abs(median_angle) < 0.1:
+        log.info("Skew angle ≈ 0° – no rotation needed.")
+        return image
+
+    log.info("Detected skew: %.2f° → rotating.", median_angle)
+    h, w = image.shape[:2]
+    centre = (w / 2, h / 2)
+    M = cv2.getRotationMatrix2D(centre, median_angle, 1.0)
+
+    # Expand canvas so corners aren't clipped
+    cos, sin_ = abs(M[0, 0]), abs(M[0, 1])
+    new_w = int(h * sin_ + w * cos)
+    new_h = int(h * cos + w * sin_)
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+
+    rotated = cv2.warpAffine(
+        image, M, (new_w, new_h), borderMode=cv2.BORDER_REPLICATE
+    )
+    return rotated
+
+
+# ---------------------------------------------------------------------------
+# Step 4 – Noise removal
+# ---------------------------------------------------------------------------
+def remove_noise(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """Apply Non-Local Means denoising followed by light morphological cleanup."""
+    if image.ndim == 3:
+        denoised = cv2.fastNlMeansDenoisingColored(
+            image,
+            None,
+            cfg.denoise_h,
+            cfg.denoise_h,
+            cfg.denoise_template_window,
+            cfg.denoise_search_window,
+        )
+    else:
+        denoised = cv2.fastNlMeansDenoising(
+            image,
+            None,
+            cfg.denoise_h,
+            cfg.denoise_template_window,
+            cfg.denoise_search_window,
+        )
+
+    # Small morphological opening to remove speckles
+    if cfg.morph_kernel_size > 0:
+        kern = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (cfg.morph_kernel_size * 2 + 1, cfg.morph_kernel_size * 2 + 1),
+        )
+        denoised = cv2.morphologyEx(denoised, cv2.MORPH_OPEN, kern)
+
+    log.info("Noise removal complete.")
+    return denoised
+
+
+# ---------------------------------------------------------------------------
+# Step 5 – Contrast enhancement (CLAHE)
+# ---------------------------------------------------------------------------
+def enhance_contrast(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """Improve local contrast with CLAHE on the L channel (LAB colour-space)."""
+    clahe = cv2.createCLAHE(
+        clipLimit=cfg.clahe_clip_limit,
+        tileGridSize=cfg.clahe_grid_size,
+    )
+    if image.ndim == 3:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+    else:
+        enhanced = clahe.apply(image)
+
+    log.info("Contrast enhancement (CLAHE) applied.")
+    return enhanced
+
+
+# ---------------------------------------------------------------------------
+# Step 6 – Adaptive thresholding (binarisation)
+# ---------------------------------------------------------------------------
+def adaptive_threshold(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """Produce a clean binary image using adaptive Gaussian thresholding."""
+    gray = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 3
+        else image
+    )
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        cfg.adaptive_block_size,
+        cfg.adaptive_c,
+    )
+    log.info("Adaptive thresholding applied (block=%d, C=%d).",
+             cfg.adaptive_block_size, cfg.adaptive_c)
+    return binary
+
+
+# ---------------------------------------------------------------------------
+# Step 7 – Optional resize for OCR
+# ---------------------------------------------------------------------------
+def resize_for_ocr(
+    image: np.ndarray,
+    cfg: PipelineConfig,
+) -> np.ndarray:
+    """Resize so the longest edge is *output_max_edge* pixels (if set)."""
+    if cfg.output_max_edge <= 0:
+        return image
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= cfg.output_max_edge:
+        return image
+    scale = cfg.output_max_edge / longest
+    new_size = (int(w * scale), int(h * scale))
+    resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+    log.info("Resized to %dx%d for OCR.", new_size[0], new_size[1])
+    return resized
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestrator
+# ---------------------------------------------------------------------------
+def run_pipeline(
+    image: np.ndarray,
+    cfg: PipelineConfig | None = None,
+    *,
+    save_steps: bool = False,
+    output_dir: Path | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Execute the full preprocessing pipeline and return the final image.
+
+    Returns
+    -------
+    final : np.ndarray
+        OCR-ready binary image.
+    intermediates : dict[str, np.ndarray]
+        Mapping of step-name → image for every stage (always populated,
+        but only written to disk when *save_steps* is True).
+    """
+    if cfg is None:
+        cfg = PipelineConfig()
+
+    intermediates: dict[str, np.ndarray] = {"00_original": image.copy()}
+    current = image.copy()
+
+    # 1. Boundary detection + perspective correction
+    corners = detect_document_boundary(current, cfg)
+    if corners is not None:
+        current = correct_perspective(current, corners)
+        intermediates["01_perspective"] = current.copy()
+    else:
+        log.info("Boundary not detected – using original frame.")
+        intermediates["01_perspective"] = current.copy()
+
+    # 2. Deskew
+    current = deskew(current, cfg)
+    intermediates["02_deskew"] = current.copy()
+
+    # 3. Noise removal
+    current = remove_noise(current, cfg)
+    intermediates["03_denoised"] = current.copy()
+
+    # 4. Contrast enhancement
+    current = enhance_contrast(current, cfg)
+    intermediates["04_contrast"] = current.copy()
+
+    # 5. Adaptive thresholding
+    current = adaptive_threshold(current, cfg)
+    intermediates["05_threshold"] = current.copy()
+
+    # 6. Resize
+    current = resize_for_ocr(current, cfg)
+    intermediates["06_final"] = current.copy()
+
+    # Optionally persist intermediates
+    if save_steps and output_dir is not None:
+        step_dir = output_dir / "steps"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        for name, img in intermediates.items():
+            cv2.imwrite(str(step_dir / f"{name}.png"), img)
+        log.info("Intermediate images saved to %s", step_dir)
+
+    return current, intermediates
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Preprocess scanned historical land records for OCR.",
+    )
+    p.add_argument("input", type=Path, help="Path to the input scan image.")
+    p.add_argument("-o", "--output", type=Path, default=None,
+                   help="Output image path (default: <input>_processed.png).")
+    p.add_argument("--save-steps", action="store_true",
+                   help="Save intermediate images for each pipeline stage.")
+    p.add_argument("--max-edge", type=int, default=0,
+                   help="Resize longest edge to this value (0 = keep).")
+    p.add_argument("--block-size", type=int, default=31,
+                   help="Adaptive threshold block size (must be odd).")
+    p.add_argument("--clahe-clip", type=float, default=2.0,
+                   help="CLAHE clip limit for contrast enhancement.")
+    p.add_argument("--denoise-h", type=int, default=10,
+                   help="Non-Local Means filter strength.")
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _build_parser().parse_args(argv)
+
+    input_path: Path = args.input
+    if not input_path.exists():
+        log.error("Input file not found: %s", input_path)
+        sys.exit(1)
+
+    image = cv2.imread(str(input_path))
+    if image is None:
+        log.error("Failed to decode image: %s", input_path)
+        sys.exit(1)
+
+    log.info("Loaded %s (%dx%d)", input_path.name, image.shape[1], image.shape[0])
+
+    cfg = PipelineConfig(
+        output_max_edge=args.max_edge,
+        adaptive_block_size=args.block_size,
+        clahe_clip_limit=args.clahe_clip,
+        denoise_h=args.denoise_h,
+    )
+
+    output_path: Path = args.output or input_path.with_name(
+        f"{input_path.stem}_processed.png"
+    )
+
+    final, _ = run_pipeline(
+        image,
+        cfg,
+        save_steps=args.save_steps,
+        output_dir=output_path.parent,
+    )
+
+    cv2.imwrite(str(output_path), final)
+    log.info("OCR-ready image saved → %s", output_path)
+
+
+if __name__ == "__main__":
+    main()
